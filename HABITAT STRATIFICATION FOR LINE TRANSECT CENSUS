@@ -1,0 +1,129 @@
+#############################################
+# HABITAT STRATIFICATION FOR LINE TRANSECT CENSUS
+# Author: DAVIDE CARNIATO
+# Date: 11/2024
+#############################################
+
+# Load required libraries
+library(sf)           # Spatial data
+library(dplyr)        # Data manipulation
+library(terra)        # Raster handling
+library(exactextractr) # Raster sampling
+library(writexl)      # Export to Excel
+library(ggplot2)      # Visualization
+
+# -------------------------
+# 1. Load spatial data
+# -------------------------
+# Replace with your own datasets
+transect_data1 <- st_read("path_to_transect_shapefile1.shp")
+transect_data2 <- st_read("path_to_transect_shapefile2.shp")
+observation_data1 <- st_read("path_to_observation_shapefile1.shp")
+observation_data2 <- st_read("path_to_observation_shapefile2.shp")
+
+# Merge transects and filter
+transects <- bind_rows(transect_data1, transect_data2)
+transects$speed <- transects$distance / (transects$duration / 60)
+transects <- transects %>% filter(distance > 3, speed < 5.7)
+
+# Merge observations
+observations <- bind_rows(observation_data1, observation_data2)
+
+# Standardize coordinate reference system (CRS)
+habitat_raster <- rast("path_to_raster.tif")
+observations <- st_transform(observations, crs = st_crs(habitat_raster))
+transects <- st_transform(transects, crs = st_crs(habitat_raster))
+
+# -------------------------
+# 2. Reclassify habitat raster
+# -------------------------
+reclass_table <- data.frame(
+  from = 1:50,  # Original classes
+  to = rep(1:13, length.out = 50)  # New classes
+)
+
+reclassified_raster <- classify(habitat_raster, rcl = reclass_table)
+
+# Aggregate raster to coarser resolution
+mode_function <- function(x, na.rm = FALSE) {
+  if (na.rm) x <- na.omit(x)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+aggregated_raster <- aggregate(reclassified_raster, fact = 5, fun = mode_function)
+aggregated_raster <- classify(aggregated_raster, rcl = data.frame(c(NA, 14), c(14, 14)))
+
+# -------------------------
+# 3. Split transects by habitat type
+# -------------------------
+habitat_polygons <- as.polygons(aggregated_raster, dissolve = FALSE)
+intersected_transects <- st_intersection(transects, st_as_sf(habitat_polygons))
+intersected_transects$length <- st_length(intersected_transects)
+intersected_transects$id <- intersected_transects$ID
+
+df_transects <- st_drop_geometry(intersected_transects)
+
+# -------------------------
+# 4. Sample raster at observation points
+# -------------------------
+sampled_values <- extract(aggregated_raster, observations)
+df_observations <- as.data.frame(observations)
+df_observations$habitat_value <- sampled_values
+df_observations <- df_observations %>%
+  mutate(species = tolower(species),
+         species = as.factor(species),
+         id_transect = id)
+
+# Keep only observations corresponding to transects
+df_observations <- df_observations %>%
+  semi_join(df_transects, by = "id_transect")
+
+# -------------------------
+# 5. Summarize transects and observations
+# -------------------------
+transect_summary <- df_transects %>%
+  group_by(id_transect, habitat_value) %>%
+  summarize(total_length = sum(length, na.rm = TRUE), .groups = 'drop')
+
+observation_summary <- df_observations %>%
+  group_by(id_transect, habitat_value, species) %>%
+  summarize(count = n(), total_count = sum(count), .groups = 'drop')
+
+# Merge summaries
+ika_data <- inner_join(transect_summary, observation_summary, by = c("id_transect", "habitat_value"))
+
+# -------------------------
+# 6. Calculate IKA
+# -------------------------
+ika_data <- ika_data %>%
+  mutate(IKA = (count * 1000) / total_length) %>%
+  select(id_transect, habitat_value, total_length, species, count, total_count, IKA)
+
+# -------------------------
+# 7. Export data
+# -------------------------
+write_xlsx(ika_data, "ika_results.xlsx")
+write.csv(ika_data, "ika_results.csv", row.names = FALSE)
+
+# -------------------------
+# 8. Plot results
+# -------------------------
+# Filter by habitat type
+habitat_filtered <- ika_data %>% filter(habitat_value == 2)  # Example: agricultural habitat
+
+# Remove outliers by Z-score
+habitat_filtered$z_score <- (habitat_filtered$IKA - mean(habitat_filtered$IKA, na.rm = TRUE)) / sd(habitat_filtered$IKA, na.rm = TRUE)
+habitat_clean <- habitat_filtered[abs(habitat_filtered$z_score) < 3, ]
+
+# Scatter plot
+ggplot(habitat_clean, aes(x = species, y = IKA)) +
+  geom_point(size = 3, color = "blue") +
+  labs(x = "Species", y = "IKA") +
+  theme_minimal()
+
+# Boxplot
+ggplot(habitat_clean, aes(x = species, y = IKA)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue") +
+  labs(x = "Species", y = "IKA") +
+  theme_minimal()
